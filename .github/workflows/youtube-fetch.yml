@@ -1,0 +1,95 @@
+name: YouTube RSS Fetch (coach channels)
+
+# Claude Code の Routine（クラウドサンドボックス）は YouTube への outbound が
+# EGRESS_BLOCKED のため取得できない。GitHub Actions の通常ランナーはアクセス
+# できるので、ここでは「新着動画の字幕/概要を _inbox/youtube/ に生で置く」
+# ところまでだけを担当する。要約・最終保存先への振り分け・スキル化は
+# 既存の Claude Code Routine（4時間おき）が _inbox を読みに来て行う。
+
+on:
+  schedule:
+    - cron: "10 */4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install yt-dlp
+        run: pip install --quiet yt-dlp
+
+      - name: Fetch new videos into _inbox/youtube
+        run: |
+          set -e
+          mkdir -p _inbox/youtube
+
+          fetch_channel() {
+            local key="$1"
+            local channel_id="$2"
+            mkdir -p "_inbox/youtube/${key}"
+
+            curl -s -A "Mozilla/5.0" \
+              "https://www.youtube.com/feeds/videos.xml?channel_id=${channel_id}" \
+              -o "/tmp/${key}.xml"
+
+            grep -oP '(?<=<yt:videoId>)[^<]+' "/tmp/${key}.xml" | while read -r vid; do
+              out="_inbox/youtube/${key}/${vid}.md"
+              if [ -f "$out" ]; then
+                continue
+              fi
+
+              title=$(grep -A2 "<yt:videoId>${vid}</yt:videoId>" "/tmp/${key}.xml" \
+                | grep -oP '(?<=<title>)[^<]+' | head -1)
+
+              rm -f "/tmp/${vid}."*.vtt
+              yt-dlp --skip-download --write-auto-sub --write-sub \
+                --sub-lang ja,en --sub-format vtt \
+                -o "/tmp/${vid}.%(ext)s" \
+                "https://www.youtube.com/watch?v=${vid}" || true
+
+              capfile=$(ls /tmp/"${vid}".*.vtt 2>/dev/null | head -1 || true)
+
+              {
+                echo "# ${title}"
+                echo
+                echo "video_id: ${vid}"
+                echo "channel_key: ${key}"
+                echo "url: https://www.youtube.com/watch?v=${vid}"
+                echo
+                echo "---"
+                echo
+                if [ -n "$capfile" ]; then
+                  echo "## 字幕（生データ）"
+                  echo
+                  cat "$capfile"
+                else
+                  echo "## 概要欄（字幕取得不可のため代用）"
+                  echo
+                  yt-dlp --dump-json "https://www.youtube.com/watch?v=${vid}" \
+                    | python3 -c "import json,sys; print(json.load(sys.stdin).get('description','(概要欄も取得できず)'))" \
+                    || echo "(概要欄も取得できず)"
+                fi
+              } > "$out"
+            done
+          }
+
+          fetch_channel "sam" "UCEbAXLRkQKcChYgi4zSudyw"
+          fetch_channel "mensup" "UCM4qOCYKzBbuK1qK3YW9Fvg"
+          fetch_channel "meicala" "UCneMyNvntOmJJP127GK5gbg"
+
+      - name: Commit staged files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add _inbox/youtube
+          git diff --cached --quiet || git commit -m "chore: stage new YouTube captions for summarization"
+          git push
